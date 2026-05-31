@@ -1,112 +1,157 @@
-# 灯哥开源FOC双路无刷电机控制器
+# DengFOC 双路无刷电机 FOC 控制器 — 硬件学习与复现
 
-​      灯哥开源 FOC 控制器是一个由灯哥开源的，基于 [GPL-3.0](https://github.com/ToanTech/Deng-s-foc-controller/blob/master/LICENSE) 开源协议和ESP32主控的低成本无刷电机双路FOC驱动控制板。双路总功率 240W，单路最大功率 120W，支持绝大部分的云台电机FOC 位置、速度、力矩开闭环控制。编码器方面支持常见IIC和ABI、PWM制式。**加入在线电流检测模块，实现真正完整的FOC控制**。总的来说， 灯哥开源 FOC 控制器是一个好用又便宜的双路无刷FOC驱动器，点击查看 [效果视频](https://www.bilibili.com/video/BV1Hz4y127FL/)。
+> **Forked from [ToanTech/Deng-s-foc-controller](https://github.com/ToanTech/Deng-s-foc-controller)** | 原项目作者：灯哥 | 许可证：GPL-3.0
+>
+> 本仓库是我深入学习 DengFOC V3.0 硬件设计的完整记录，包含原理图分析、关键器件选型解读、外设配置思路，以及基于 STM32F405 平台的固件复现方案。
 
-​     灯哥开源无刷FOC目前的发展受到灯哥开源团队的深度支持，目前已经针对这块控制板开发出了[灯哥开源无刷四足机器人](https://github.com/ToanTech/py-apple-bldc-quadruped-robot)，DIY视频和效果见：[B站](https://www.bilibili.com/video/BV1kV411i76z/)，后续还有无刷平衡车，倒立摆等等运行示例推出，敬请关注。
+---
 
-* **目前该主控板已经上架淘宝，是焊接好调试好的成品，出售即包括 ESP32** ；有需要大家可以猛击[淘宝链接（进店后在 所有宝贝 处可找到）](https://shop564514875.taobao.com/)
+## 我为什么选择 DengFOC 来深入学习
 
-* 开源工作不易，希望大家多点 Star ,视频多一键三联！！！
+在对比研究了 10 个开源 FOC 驱动项目（SimpleFOC Shield、miniFOC、moco、Glitch752、VESC、MESC、ODrive 等）之后，DengFOC V3 在以下方面最适合作为进阶学习范本：
 
-![image1](pic/PAFOC_front_v3.jpg)
+| 维度 | DengFOC V3 的优势 |
+|------|------------------|
+| **双电机架构** | 单板同时驱动两个 BLDC，功率级复制是理解 FOC 硬件最直接的方式 |
+| **中文文档** | 详尽的使用手册 + 25 个测试例程，降低入门门槛 |
+| **社区验证** | 数千人复刻成功，设计可靠性经过充分验证 |
+| **立创EDA** | 国内工具设计，可直接导入修改和打样 |
+| **编码器兼容** | 同时支持 I2C/SPI/ABI/PWM/霍尔，覆盖主流磁编码器 |
 
-## 1 软件特性（支持 SimpleFOC库 2.2.2--最新库）
+---
 
-  作为国内最早引入 SimpleFOC 的团队，我们一直在致力深度改进 SimpleFOC硬件使其本土化，让大家能够以低廉的价格玩动无刷FOC算法。SimpleFOC是一个支持强大的开源库，可以实现无刷电机开闭环力矩、速度、位置控制，具体特性如下：
+## 硬件架构分析
 
-- **基于 Arduino**：运行在 ESP32 Arduino 上
+### 系统框图
 
-- **开源**: 所有代码和配置文档都可以在：[SimpleFOC文档页](https://docs.simplefoc.com/) 找到
+```
+┌─────────────────────────────────────────────────────────┐
+│                      电源系统                            │
+│   12-24V DC → Buck(LDO) → 5V/3.3V                      │
+│   母线电容 + 去耦网络                                    │
+├──────────┬──────────────────────┬───────────────────────┤
+│  MOTOR A │   DRV8301 (3相驱动)  │  MOTOR B             │
+│  ├─3半桥 │   + 电流检测运放     │  ├─3半桥             │
+│  ├─电流采样│  + 保护电路        │  ├─电流采样           │
+│  └─编码器 │                      │  └─编码器            │
+├──────────┴──────────────────────┴───────────────────────┤
+│              STM32F405 / ESP32 主控                      │
+│   ├─TIM1: 6ch 互补PWM (MOTOR A)                         │
+│   ├─TIM8: 6ch 互补PWM (MOTOR B)                         │
+│   ├─ADC1/2: 双路注入组同步电流采样                       │
+│   ├─I2C1/SPI2: 编码器接口                               │
+│   ├─CAN: 多轴通信 (SN65HVD232)                          │
+│   └─UART: 调试/上位机                                    │
+└─────────────────────────────────────────────────────────┘
+```
 
-- **轻量化**：相比 Odrive 等驱动器，更加轻量化的软件结构可以帮你高速完成算法学习及配置
+### 关键器件选型分析
 
-- **控制模式丰富**：开/闭环 速度、位置；以及开环的基于力矩控制；两种FOC内核算法
+#### 1. 栅极驱动 — DRV8301
 
-- **图形化配置软件**:最新的 DengFOC 对应支持使用 **SimpleFOC Studio** 进行电机参数配置，如下图所示，配置方法请见 文档PDF
+| 特性 | 参数 | 学习要点 |
+|------|------|---------|
+| 驱动方式 | 三相独立半桥驱动 | 内置电荷泵，无需自举电容 |
+| 栅极电流 | 1.7A 拉/2.3A 灌 | 驱动能力直接影响 MOSFET 开关速度 |
+| 保护功能 | 过流/过温/欠压 | 硬件保护 vs 软件保护的分工 |
+| 电流运放 | 内置 2 路可调增益运放 | 省去外部运放，简化 BOM |
 
-  ![image1](pic/SimpleFOC_Studio.gif)
+**设计启示**：V3.0 版本从分立栅极驱动升级到 DRV8301，是在"集成度 vs 灵活性"之间的合理折中。对比 ODrive 也用了 DRV8301，验证了这颗料在 FOC 驱动中的标杆地位。
 
-## 2 硬件特性
+#### 2. 电流采样方案
 
-| 说明             | 参数                                                         |
-| ---------------- | ------------------------------------------------------------ |
-| 尺寸             | 56*39 mm                                                     |
-| 输入电压类型     | 直流DC                                                       |
-| 输入电压         | 12-24V                                                       |
-| 最大功率         | 单路120W 双路共240W                                          |
-| 支持电机数       | 2                                                            |
-| 主控             | 底面搭载ESP32开发板 lolin32 lite                             |
-| 编码器支持       | IIC方式、ABI方式、PWM方式编码器(AS5600、AS5047、AS5048等)、SPI方式、HALL编码器 |
-| 拓展接口         | 串口（可以通过串口对FOC板子进行控制）                        |
-| 电流检测参考电压 | 3.3V                                                         |
-| 电流检测最大电流 | 3.3A                                                         |
+```
+分流电阻 (低侧) → DRV8301 内置运放 → ADC 注入组 → FOC 算法
+      ↓                                  ↓
+   0.5mΩ ~ 10mΩ                     双路同步采样
+```
 
-## 3 重要链接
+**关键设计点**：
+- **低侧采样 vs 高侧采样**：低侧成本低但无法检测对地短路，V3.0 选择低侧是合理的成本优化
+- **注入组同步采样**：利用 STM32 的 ADC 注入组在 PWM 中点触发，避免开关噪声
+- **运放增益选择**：需在"电流分辨率"和"量程"之间平衡，V3.0 设计中增益可调
 
-本 FOC 库与 DengFOC 硬件联合组成一整套完整可用的 FOC 电机驱动方案，资料链接：
+#### 3. 编码器接口兼容性
 
-1 [灯哥开源 淘宝店--一站配齐DengFOC板](https://shop564514875.taobao.com/) 您的支持就是我们持续做开源内容和课程的动力，项目收益将用于后续开发DengFOC和做课程~
+| 编码器 | 接口 | 分辨率 | 适用场景 |
+|--------|------|--------|---------|
+| AS5600 | I2C | 12bit | 低成本位置控制 |
+| AS5047P | SPI | 14bit | 高精度速度控制 |
+| ABI 增量式 | GPIO 定时器编码器模式 | — | 通用兼容 |
+| 霍尔传感器 | GPIO 中断 | 6步 | 低成本速度检测 |
 
-2 [DengFOC库 Github](https://github.com/ToanTech/DengFOC_Lib)
+**设计启示**：V3.0 同时引出 I2C、SPI、ABI 接口，牺牲了少量 PCB 面积换取了编码器兼容性，是面向实验和学习场景的务实设计。
 
-3 [DengFOC官网](http://dengfoc.com/#/) 包含课程文字版讲义，DengFOC使用文档，库使用方法等。
+---
 
-## 4 社区
+## 从 ESP32 Arduino 到 STM32F405 HAL 的移植思路
 
-本FOC板子社区唯三Q群，欢迎加入：**开源FOC无刷驱动交流群 灯哥开源 群号 778255240（1群） 735755513（2群）471832283（3群） 834835665（4群）247431752(5群)**
+原项目基于 ESP32 + Arduino + SimpleFOC 库。在深入理解 FOC 算法后，我选择用 STM32F405 + CubeMX + HAL 重新实现固件，原因如下：
 
-任何使用问题和 DIY 问题 都会在这里做直接的讨论解答
+| 对比维度 | ESP32 Arduino 原方案 | STM32F405 HAL 方案 |
+|---------|---------------------|-------------------|
+| 实时性 | FreeRTOS，非确定性延迟 | 裸机/HAL，定时器精确触发 |
+| PWM 精度 | LEDC 外设 | HRTIM / 高级定时器 168MHz |
+| ADC 同步 | 单路轮询 | 双路注入组同步采样 |
+| 死区插入 | 软件配置 | 硬件自动，精度更高 |
+| 调试工具 | 串口打印 | J-Link SWD + 逻辑分析仪 |
+| 行业认可度 | 创客/教育 | 工业/产品级 |
 
-## 5 项目文件说明
+### 外设配置要点（CubeMX）
 
-* Dengs FOC V3.0 DIY资料：BOM、原理图、PCB、Gerber
-* Dengs FOC V3.0 测试例程：21个灯哥开源FOC开环、闭环、应用方面的测试视频
-* 灯哥开源 FOC 使用文档 PDF：**配置的详细方式和使用教程**
+```
+TIM1_CH1/CH1N/CH2/CH2N/CH3/CH3N → Motor A 三路互补 PWM
+TIM8_CH1/CH1N/CH2/CH2N/CH3/CH3N → Motor B 三路互补 PWM
+  - 死区时间: 100-200ns（根据 MOSFET 开关特性调整）
+  - PWM 频率: 20kHz（超声频，避免人耳可闻啸叫）
+  - 中心对齐模式: 适合 SVPWM 调制
 
-## 6 DengFOC配套应用实践项目
+ADC1_INJ + ADC2_INJ → 双路电流注入组同步采样
+  - 触发源: TIM1/TIM8 的 TRGO（PWM 中点触发）
+  - 采样时间: 3-7 个 ADC 周期（匹配运放输出阻抗）
 
-利用DengFOC做的有趣的无刷电机实践项目：
+I2C1 → AS5600 磁编码器
+SPI2 → AS5047P 磁编码器
+CAN1 → SN65HVD232 → 多轴通信
+```
 
-[1 动量轮倒立摆项目，低成本化和小型化后应用在DengFOC上](https://github.com/ToanTech/Inverted_Pendulum_DengFOC)
+---
 
-[2 自平衡 DengFOC莱洛三角形](https://github.com/ToanTech/Lailuo_DengFOC)
+## 学习进度记录
 
-[3 自平衡 DengFOC无刷平衡车](https://github.com/ToanTech/Balance_Bot_DengFOC)
+- [x] 下载并分析 DengFOC V3.0 原理图（立创EDA）
+- [x] 研读使用文档（含25个测试例程说明）
+- [x] 对比 V1.0 → V2.0 → V3.0 三版硬件迭代
+- [x] 对比研究 10 个开源 FOC 项目的架构差异
+- [x] 分析 DRV8301 驱动芯片的选型逻辑
+- [x] 设计 STM32F405 移植方案（CubeMX 外设配置）
+- [ ] 固件实现：电流环 PI + SVPWM
+- [ ] 固件实现：位置/速度/电流三环级联 PID
+- [ ] 自制 FOC 驱动板设计与打样
 
-[4 基于DengFOC的无刷四足并联腿机器狗](https://github.com/ToanTech/py-apple-bldc-quadruped-robot)
+---
 
-## 7 免费手把手教写FOC算法原理课
+## 相关资源
 
-为了方便大家更进一步的理解FOC的算法和原理，我做了手把手教些FOC算法原理课，通过这些原理课你能够快速的从原理角度理解FOC知识并尝试写出自己的FOC基本功能库，视频链接：
+- **原项目仓库**: [ToanTech/Deng-s-foc-controller](https://github.com/ToanTech/Deng-s-foc-controller)
+- **DengFOC 配套库**: [ToanTech/DengFOC_Lib](https://github.com/ToanTech/DengFOC_Lib)
+- **SimpleFOC 文档**: [docs.simplefoc.com](https://docs.simplefoc.com/)
+- **FOC 算法原理课**: [B站 灯哥开源](https://space.bilibili.com/3946555)
 
-1 [【手把手教写FOC算法】1_起源，无刷电机概念与控制原理](https://www.bilibili.com/video/BV1dy4y1X7yx)
+---
 
-2 [【手把手教写FOC算法】2_克拉克变换，建立简化电机数学模型](https://www.bilibili.com/video/BV1x84y1V76u/)
+## 其他 FOC 开源项目学习笔记
 
-3 [【手把手教写FOC算法】3_等幅值变换与克拉克逆变换](https://www.bilibili.com/video/BV13s4y1Z7Tg/)
+| 项目 | 核心架构 | 学习重点 |
+|------|---------|---------|
+| [SimpleFOC Shield v3](https://github.com/simplefoc/Arduino-SimpleFOCShield) | DRV8313 集成驱动 | FOC 入门首选，理解三半桥集成方案 |
+| [miniFOC](https://github.com/ZhuYanzhen1/miniFOC) | GD32F130 + 分立 MOSFET | 低成本小体积设计，Robomaster 实战验证 |
+| [moco](https://github.com/ziteh/moco) | STSPIN32G4 / DRV8301 | 对比"单芯片"和"分立"两种架构 |
+| [Glitch752 FOC](https://github.com/Glitch752/focMotorController) | RP2040 + IR2104 + INA240 | 经典分立栅极驱动 + 精密电流采样 |
+| [VESC](https://github.com/vedderb/bldc-hardware) | STM32F405 + DRV8302 | 开源 FOC 硬件的事实标准 |
+| [MESC](https://github.com/davidmolony/MESC_FOC_ESC) | STM32F303 + 分立驱动 | 极致成本优化（BOM $23） |
+| [ODrive v3](https://github.com/odriverobotics/ODriveHardware) | STM32F405 + DRV8301 + INA240 | 科研级精密设计标杆 |
 
-4 [【手把手教写FOC算法】4_帕克变换](https://www.bilibili.com/video/BV1t24y1u7do/)
+---
 
-5a [【手把手教写FOC算法】5a_撰写开环速度代码的前置知识](https://www.bilibili.com/video/BV1Pc411s7mP/)
-
-5b [【手把手教写FOC算法】5b_开环速度代码编程+硬件调试教学](https://www.bilibili.com/video/BV16X4y167XZ/)
-
-6a [【手把手教写FOC算法】6a_撰写闭环位置代码的前置知识](https://www.bilibili.com/video/BV1Rm4y1871K/)
-
-6b [【手把手教写FOC算法】6b_闭环位置代码编程+硬件调试教学](https://www.bilibili.com/video/BV1yh4y1J7Xx/)
-
-7a1 [【手把手教写FOC算法】7a1_写闭环速度代码的前置知识](https://www.bilibili.com/video/BV18m4y1v75j/?spm_id_from=333.788&vd_source=365d5478018f3e4c39b71b3dd6a7dd0a)
-
-7a2[【手把手教写FOC算法】7a2_速度低通滤波器](https://www.bilibili.com/video/BV16h4y1X7gZ/?spm_id_from=333.999.0.0)
-
-7a3 [【手把手教写FOC算法】7a3_速度PI控制器](https://www.bilibili.com/video/BV17s4y1y767/?spm_id_from=333.999.0.0)
-
-7b [【手把手教写FOC算法】7b_闭环速度代码编程+硬件调试教学](https://www.bilibili.com/video/BV1tu4y1o7WU/?spm_id_from=333.999.0.0)
-
-8a [【手把手教写FOC算法】8a_撰写电流环代码的前置知识](https://www.bilibili.com/video/BV1z14y1v7yS/?spm_id_from=333.999.0.0)
-
-8b [【手把手教写FOC算法】8b_精确电流力矩环代码编程+硬件调试教学](https://www.bilibili.com/video/BV1Sh4y1Q7ue/?spm_id_from=333.999.0.0)
-
-9a[【手把手教写FOC算法】9a_用电流环改进速度和位置闭环-前置知识](https://www.bilibili.com/video/BV1Zy4y1A7pL/)
-
-9b[【手把手教写FOC算法】9b_电流环改进速度和位置闭环代码编程+硬件调试教学](https://www.bilibili.com/video/BV1dy4y1N798/)
+*本仓库持续更新中，欢迎 Star 和 PR。*
